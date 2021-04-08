@@ -6,6 +6,8 @@
 #endif
 #include <unistd.h>
 #include <fcntl.h>
+#include <spawn.h>
+#include <sys/wait.h>
 #ifdef HAVE_SYS_TYPES_H
 #include <sys/types.h>
 #endif
@@ -216,6 +218,28 @@ make_inheritable(PyObject *py_fds_to_keep, int errpipe_write)
     return 0;
 }
 
+static int
+make_inheritable_for_occlum(PyObject *py_fds_to_keep, int errpipe_write, posix_spawn_file_actions_t* actions)
+{
+    Py_ssize_t i, len;
+
+    len = PyTuple_GET_SIZE(py_fds_to_keep);
+    for (i = 0; i < len; ++i) {
+        PyObject* fdobj = PyTuple_GET_ITEM(py_fds_to_keep, i);
+        long fd = PyLong_AsLong(fdobj);
+        assert(!PyErr_Occurred());
+        assert(0 <= fd && fd <= INT_MAX);
+        if (fd == errpipe_write) {
+            /* errpipe_write is part of py_fds_to_keep. It must be closed at
+               exec(), but kept open in the child process until exec() is
+               called. */
+            continue;
+        }
+        if (_Py_set_inheritable_async_safe_for_occlum((int)fd, 1, NULL, actions) < 0)
+            return -1;
+    }
+    return 0;
+}
 
 /* Get the maximum file descriptor that could be opened by this process.
  * This function is async signal safe for use between fork() and exec().
@@ -245,6 +269,21 @@ safe_get_max_fd(void)
 }
 
 
+static long
+safe_get_max_usable_fd()
+{
+    int maxfd = safe_get_max_fd();
+    int ignore;
+    for (; maxfd > 3; maxfd--)
+        if (fcntl (maxfd, F_GETFD, &ignore) == -1) {
+            break;
+        }
+    if (maxfd <= 3) return -1;
+
+    return maxfd;
+}
+
+
 /* Close all file descriptors in the range from start_fd and higher
  * except for those in py_fds_to_keep.  If the range defined by
  * [start_fd, safe_get_max_fd()) is large this will take a long
@@ -271,6 +310,27 @@ _close_fds_by_brute_force(long start_fd, PyObject *py_fds_to_keep)
     }
     if (start_fd <= end_fd) {
         _Py_closerange(start_fd, end_fd);
+    }
+}
+
+static void
+_close_fds_by_brute_force_for_occlum(long start_fd, PyObject *py_fds_to_keep, posix_spawn_file_actions_t* actions)
+{
+    long end_fd = safe_get_max_fd();
+    Py_ssize_t num_fds_to_keep = PyTuple_GET_SIZE(py_fds_to_keep);
+    Py_ssize_t keep_seq_idx;
+    /* As py_fds_to_keep is sorted we can loop through the list closing
+     * fds in between any in the keep list falling within our range. */
+    for (keep_seq_idx = 0; keep_seq_idx < num_fds_to_keep; ++keep_seq_idx) {
+        PyObject* py_keep_fd = PyTuple_GET_ITEM(py_fds_to_keep, keep_seq_idx);
+        int keep_fd = PyLong_AsLong(py_keep_fd);
+        if (keep_fd < start_fd)
+            continue;
+        _Py_closerange_for_occlum(start_fd, keep_fd - 1, actions);
+        start_fd = keep_fd + 1;
+    }
+    if (start_fd <= end_fd) {
+        _Py_closerange_for_occlum(start_fd, end_fd, actions);
     }
 }
 
@@ -334,6 +394,42 @@ _close_open_fds_safe(int start_fd, PyObject* py_fds_to_keep)
                 if (fd != fd_dir_fd && fd >= start_fd &&
                     !_is_fd_in_sorted_fd_sequence(fd, py_fds_to_keep)) {
                     close(fd);
+                }
+            }
+        }
+        close(fd_dir_fd);
+    }
+}
+
+static void
+_close_open_fds_safe_for_occlum(int start_fd, PyObject* py_fds_to_keep, posix_spawn_file_actions_t* actions)
+{
+    int fd_dir_fd;
+
+    fd_dir_fd = _Py_open_noraise(FD_DIR, O_RDONLY);
+    if (fd_dir_fd == -1) {
+        /* No way to get a list of open fds. */
+        _close_fds_by_brute_force_for_occlum(start_fd, py_fds_to_keep, actions);
+        return;
+    } else {
+        char buffer[sizeof(struct linux_dirent64)];
+        int bytes;
+        while ((bytes = syscall(SYS_getdents64, fd_dir_fd,
+                                (struct linux_dirent64 *)buffer,
+                                sizeof(buffer))) > 0) {
+            struct linux_dirent64 *entry;
+            int offset;
+#ifdef _Py_MEMORY_SANITIZER
+            __msan_unpoison(buffer, bytes);
+#endif
+            for (offset = 0; offset < bytes; offset += entry->d_reclen) {
+                int fd;
+                entry = (struct linux_dirent64 *)(buffer + offset);
+                if ((fd = _pos_int_from_ascii(entry->d_name)) < 0)
+                    continue;  /* Not a number. */
+                if (fd != fd_dir_fd && fd >= start_fd &&
+                    !_is_fd_in_sorted_fd_sequence(fd, py_fds_to_keep)) {
+                    posix_spawn_file_actions_addclose(actions, fd);
                 }
             }
         }
@@ -455,6 +551,47 @@ reset_signal_handlers(const sigset_t *child_sigmask)
          * the child seems to be too harsh, so ignore errors. */
         (void) sigaction(sig, &sa_dfl, NULL);
     }
+}
+
+static void
+reset_signal_handlers_posix_attr(const sigset_t *child_sigmask, posix_spawnattr_t *attr)
+{
+    posix_spawnattr_setflags(attr, POSIX_SPAWN_SETSIGMASK);
+    posix_spawnattr_setsigdefault(attr, child_sigmask);
+
+
+    // struct sigaction sa_dfl = {.sa_handler = SIG_DFL};
+    // for (int sig = 1; sig < _NSIG; sig++) {
+    //     /* Dispositions for SIGKILL and SIGSTOP can't be changed. */
+    //     if (sig == SIGKILL || sig == SIGSTOP) {
+    //         continue;
+    //     }
+
+    //     /* There is no need to reset the disposition of signals that will
+    //      * remain blocked across execve() since the kernel will do it. */
+    //     if (sigismember(child_sigmask, sig) == 1) {
+    //         continue;
+    //     }
+
+    //     struct sigaction sa;
+    //     /* C libraries usually return EINVAL for signals used
+    //      * internally (e.g. for thread cancellation), so simply
+    //      * skip errors here. */
+    //     if (sigaction(sig, NULL, &sa) == -1) {
+    //         continue;
+    //     }
+
+    //     /* void *h works as these fields are both pointer types already. */
+    //     void *h = (sa.sa_flags & SA_SIGINFO ? (void *)sa.sa_sigaction :
+    //                                           (void *)sa.sa_handler);
+    //     if (h == SIG_IGN || h == SIG_DFL) {
+    //         continue;
+    //     }
+
+    //     /* This call can't reasonably fail, but if it does, terminating
+    //      * the child seems to be too harsh, so ignore errors. */
+    //     (void) sigaction(sig, &sa_dfl, NULL);
+    // }
 }
 #endif /* VFORK_USABLE */
 
@@ -754,6 +891,146 @@ do_fork_exec(char *const exec_array[],
     return 0;  /* Dead code to avoid a potential compiler warning. */
 }
 
+_Py_NO_INLINE static pid_t
+do_fork_exec_for_occlum(char *const exec_array[],
+             char *const argv[],
+             char *const envp[],
+             const char *cwd,
+             int p2cread, int p2cwrite,
+             int c2pread, int c2pwrite,
+             int errread, int errwrite,
+             int errpipe_read, int errpipe_write,
+             int close_fds, int restore_signals,
+             int call_setsid,
+             int call_setgid, gid_t gid,
+             int call_setgroups, size_t groups_size, const gid_t *groups,
+             int call_setuid, uid_t uid, int child_umask,
+             const void *child_sigmask,
+             PyObject *py_fds_to_keep,
+             PyObject *preexec_fn,
+             PyObject *preexec_fn_args_tuple)
+{
+
+    pid_t pid;
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    // int child_process_lowest_fd = 50;
+    if (make_inheritable_for_occlum(py_fds_to_keep, errpipe_write, &actions) < 0)
+        // goto error;
+        return -1;
+
+     /* Close parent's pipe ends. */
+    if (p2cwrite != -1)
+        posix_spawn_file_actions_addclose(&actions, p2cwrite);
+    if (c2pread != -1)
+        posix_spawn_file_actions_addclose(&actions, c2pread);
+    if (errread != -1)
+        posix_spawn_file_actions_addclose(&actions, errread);
+    posix_spawn_file_actions_addclose(&actions, errpipe_read);
+
+    /* When duping fds, if there arises a situation where one of the fds is
+       either 0, 1 or 2, it is possible that it is overwritten (#12607). */
+    if (c2pwrite == 0) {
+        posix_spawn_file_actions_adddup2(&actions, c2pwrite, safe_get_max_usable_fd());
+        /* issue32270 */
+        // if (_Py_set_inheritable_async_safe(c2pwrite, 0, NULL) < 0) {
+        //     goto error;
+        // }
+        // child_process_lowest_fd++;
+    }
+
+    while (errwrite == 0 || errwrite == 1) {
+        posix_spawn_file_actions_adddup2(&actions, errwrite, safe_get_max_usable_fd());
+        // child_process_lowest_fd++;
+        /* issue32270 */
+        // if (_Py_set_inheritable_async_safe(errwrite, 0, NULL) < 0) {
+        //     goto error;
+        // }
+    }
+
+    /* Dup fds for child.
+       dup2() removes the CLOEXEC flag but we must do it ourselves if dup2()
+       would be a no-op (issue #10806). */
+    if (p2cread == 0) {
+        // if (_Py_set_inheritable_async_safe(p2cread, 1, NULL) < 0)
+        //     return -1;
+    }
+    else if (p2cread != -1)
+        posix_spawn_file_actions_adddup2(&actions, p2cread, 0);  /* stdin */
+
+    if (c2pwrite == 1) {
+        // if (_Py_set_inheritable_async_safe(c2pwrite, 1, NULL) < 0)
+        //     goto error;
+    }
+    else if (c2pwrite != -1)
+        posix_spawn_file_actions_adddup2(&actions, c2pwrite, 1);  /* stdout */
+
+    if (errwrite == 2) {
+        // if (_Py_set_inheritable_async_safe(errwrite, 1, NULL) < 0)
+        //     goto error;
+    }
+    else if (errwrite != -1)
+        posix_spawn_file_actions_adddup2(&actions, errwrite, 2);  /* stderr */
+
+    if (cwd) {
+        // POSIX_CALL(chdir(cwd));
+        printf("not supported chdir for child process\n");
+    }
+
+    if (child_umask >= 0) {
+        // umask(child_umask);  /* umask() always succeeds. */
+        printf("not support umask for child process\n");
+    }
+
+    if (restore_signals) {
+        _Py_RestoreSignals();
+        printf("not support restore signal for child process\n");
+    }
+
+    if (child_sigmask) {
+        posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGMASK);
+        posix_spawnattr_setsigdefault(&attr, child_sigmask);
+        posix_spawnattr_setsigmask(&attr, child_sigmask);
+        // reset_signal_handlers_posix_attr(child_sigmask, &attr);
+        // if ((errno = pthread_sigmask(SIG_SETMASK, child_sigmask, NULL))) {
+        //     // goto error;
+        //     return -1;
+        // }
+    }
+
+    if (preexec_fn != Py_None) {
+        printf("not support pre exec function for child process\n");
+    }
+
+    if (close_fds) {
+       _close_open_fds_safe_for_occlum(3, py_fds_to_keep, &actions);
+    }
+
+    for (int i = 0; exec_array[i] != NULL; ++i) {
+        const char *executable = exec_array[i];
+        posix_spawn(&pid, executable, &actions, &attr, argv, envp);
+        // if (errno != ENOENT && errno != ENOTDIR && saved_errno == 0) {
+        //     saved_errno = errno;
+        // }
+    }
+
+//     child_exec(exec_array, argv, envp, cwd,
+//                p2cread, p2cwrite, c2pread, c2pwrite,
+//                errread, errwrite, errpipe_read, errpipe_write,
+//                close_fds, restore_signals, call_setsid,
+//                call_setgid, gid, call_setgroups, groups_size, groups,
+//                call_setuid, uid, child_umask, child_sigmask,
+//                py_fds_to_keep, preexec_fn, preexec_fn_args_tuple);
+    // _exit(255);
+    int status = 0;
+    // waitpid(pid, &status, 0);
+    if (status != 0) {
+        return -1;
+    }
+    return pid;  /* Dead code to avoid a potential compiler warning. */
+}
 
 static PyObject *
 subprocess_fork_exec(PyObject *module, PyObject *args)
@@ -1013,7 +1290,7 @@ subprocess_fork_exec(PyObject *module, PyObject *args)
     }
 #endif
 
-    pid = do_fork_exec(exec_array, argv, envp, cwd,
+    pid = do_fork_exec_for_occlum(exec_array, argv, envp, cwd,
                        p2cread, p2cwrite, c2pread, c2pwrite,
                        errread, errwrite, errpipe_read, errpipe_write,
                        close_fds, restore_signals, call_setsid,

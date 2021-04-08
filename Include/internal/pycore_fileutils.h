@@ -9,6 +9,7 @@ extern "C" {
 #endif
 
 #include <locale.h>   /* struct lconv */
+#include <spawn.h>
 
 PyAPI_DATA(int) _Py_HasFileSystemDefaultEncodeErrors;
 
@@ -49,6 +50,8 @@ PyAPI_FUNC(int) _Py_GetLocaleconvNumeric(
     PyObject **thousands_sep);
 
 PyAPI_FUNC(void) _Py_closerange(int first, int last);
+PyAPI_FUNC(void) _Py_closerange_for_occlum(int first, int last, posix_spawn_file_actions_t* actions);
+
 
 PyAPI_FUNC(wchar_t*) _Py_GetLocaleEncoding(void);
 PyAPI_FUNC(PyObject*) _Py_GetLocaleEncodingObject(void);

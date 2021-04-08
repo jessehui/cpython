@@ -3,6 +3,7 @@
 #include "pycore_runtime.h"       // _PyRuntime
 #include "osdefs.h"               // SEP
 #include <locale.h>
+// #include <spawn.h>
 
 #ifdef MS_WINDOWS
 #  include <malloc.h>
@@ -1195,6 +1196,69 @@ _Py_get_inheritable(int fd)
     return get_inheritable(fd, 1);
 }
 
+static int
+set_inheritable_for_occlum(int fd, int inheritable, int raise, int *atomic_flag_works, posix_spawn_file_actions_t* actions)
+{
+
+#if defined(HAVE_SYS_IOCTL_H) && defined(FIOCLEX) && defined(FIONCLEX)
+    static int ioctl_works = -1;
+    int request;
+    int err;
+#endif
+    int flags, new_flags;
+    int res;
+
+    /* atomic_flag_works can only be used to make the file descriptor
+       non-inheritable */
+    assert(!(atomic_flag_works != NULL && inheritable));
+
+    if (atomic_flag_works != NULL && !inheritable) {
+        if (*atomic_flag_works == -1) {
+            int isInheritable = get_inheritable(fd, raise);
+            if (isInheritable == -1)
+                return -1;
+            *atomic_flag_works = !isInheritable;
+        }
+
+        if (*atomic_flag_works)
+            return 0;
+    }
+
+    // /* slow-path: fcntl() requires two syscalls */
+    // flags = fcntl(fd, F_GETFD);
+    // if (flags < 0) {
+    //     if (raise)
+    //         PyErr_SetFromErrno(PyExc_OSError);
+    //     return -1;
+    // }
+
+    if (inheritable) {
+        // new_flags = flags & ~FD_CLOEXEC;
+        // don't close fd in child
+        int tmp_fd = 49;
+        posix_spawn_file_actions_adddup2(actions, fd, tmp_fd);
+        posix_spawn_file_actions_addclose(actions,fd);
+        posix_spawn_file_actions_adddup2(actions, tmp_fd, fd);
+        posix_spawn_file_actions_addclose(actions,tmp_fd);
+    }
+    else {
+        // new_flags = flags | FD_CLOEXEC;
+        posix_spawn_file_actions_addclose(actions, fd);
+    }
+
+    // if (new_flags == flags) {
+    //     /* FD_CLOEXEC flag already set/cleared: nothing to do */
+    //     return 0;
+    // }
+
+    // res = fcntl(fd, F_SETFD, new_flags);
+    // if (res < 0) {
+    //     if (raise)
+    //         PyErr_SetFromErrno(PyExc_OSError);
+    //     return -1;
+    // }
+    return 0;
+}
 
 /* This function MUST be kept async-signal-safe on POSIX when raise=0. */
 static int
@@ -1369,6 +1433,12 @@ int
 _Py_set_inheritable_async_safe(int fd, int inheritable, int *atomic_flag_works)
 {
     return set_inheritable(fd, inheritable, 0, atomic_flag_works);
+}
+
+int
+_Py_set_inheritable_async_safe_for_occlum(int fd, int inheritable, int *atomic_flag_works, posix_spawn_file_actions_t* actions)
+{
+    return set_inheritable_for_occlum(fd, inheritable, 0, atomic_flag_works, actions);
 }
 
 static int
@@ -2276,5 +2346,19 @@ _Py_closerange(int first, int last)
         }
     }
 #endif /* USE_FDWALK */
+    _Py_END_SUPPRESS_IPH
+}
+
+void
+_Py_closerange_for_occlum(int first, int last, posix_spawn_file_actions_t* actions)
+{
+    first = Py_MAX(first, 0);
+    _Py_BEGIN_SUPPRESS_IPH
+    {
+        for (int i = first; i <= last; i++) {
+            /* Ignore errors */
+            (void)posix_spawn_file_actions_addclose(actions, i);
+        }
+    }
     _Py_END_SUPPRESS_IPH
 }

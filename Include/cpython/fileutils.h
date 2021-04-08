@@ -2,6 +2,8 @@
 #  error "this header file must not be included directly"
 #endif
 
+#include <spawn.h>
+
 typedef enum {
     _Py_ERROR_UNKNOWN=0,
     _Py_ERROR_STRICT,
@@ -151,6 +153,9 @@ PyAPI_FUNC(int) _Py_set_inheritable(int fd, int inheritable,
 
 PyAPI_FUNC(int) _Py_set_inheritable_async_safe(int fd, int inheritable,
                                                int *atomic_flag_works);
+
+PyAPI_FUNC(int) _Py_set_inheritable_async_safe_for_occlum(int fd, int inheritable,
+                                               int *atomic_flag_works, posix_spawn_file_actions_t *actions);
 
 PyAPI_FUNC(int) _Py_dup(int fd);
 
