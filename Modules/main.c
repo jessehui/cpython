@@ -313,6 +313,14 @@ pymain_run_file_obj(PyObject *program_name, PyObject *filename,
     if (PySys_Audit("cpython.run_file", "O", filename) < 0) {
         return pymain_exit_err_print();
     }
+    // PyObject *bytes;
+    // PyUnicode_FSConverter(program_name, &bytes);
+    // char *program_path_bytes = PyBytes_AS_STRING(bytes);
+    // printf("program name = %s\n", program_path_bytes);
+
+    // PyUnicode_FSConverter(filename, &bytes);
+    // char *filename_bytes = PyBytes_AS_STRING(bytes);
+    // printf("filename_bytes name = %s\n", filename_bytes);
 
     FILE *fp = _Py_fopen_obj(filename, "rb");
     if (fp == NULL) {

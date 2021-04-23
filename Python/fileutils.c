@@ -42,6 +42,8 @@ int _Py_open_cloexec_works = -1;
 static const size_t DECODE_ERROR = ((size_t)-1);
 static const size_t INCOMPLETE_CHARACTER = (size_t)-2;
 
+#undef FIOCLEX
+#undef FIONCLEX
 
 static int
 get_surrogateescape(_Py_error_handler errors, int *surrogateescape)

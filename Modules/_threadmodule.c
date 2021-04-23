@@ -1141,7 +1141,17 @@ thread_PyThread_start_new_thread(PyObject *self, PyObject *fargs)
     boot->args = Py_NewRef(args);
     boot->kwargs = Py_XNewRef(kwargs);
 
+    // sigset_t sigset;
+    // sigaddset(&sigset, SIGCONT);
+    // sigaddset(&sigset, SIGSTOP);
+    // sigprocmask(SIG_BLOCK, &sigset, NULL);
+    // if (children > 0) {
+    //     kill(children, SIGSTOP);
+    // }
     unsigned long ident = PyThread_start_new_thread(thread_run, (void*) boot);
+    // if (children > 0) {
+    //     kill(children, SIGCONT);
+    // }
     if (ident == PYTHREAD_INVALID_THREAD_ID) {
         PyErr_SetString(ThreadError, "can't start new thread");
         PyThreadState_Clear(boot->tstate);

@@ -912,6 +912,7 @@ do_fork_exec_for_occlum(char *const exec_array[],
 {
 
     pid_t pid;
+    int ret;
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
     posix_spawnattr_t attr;
@@ -985,7 +986,7 @@ do_fork_exec_for_occlum(char *const exec_array[],
     }
 
     if (restore_signals) {
-        _Py_RestoreSignals();
+        // _Py_RestoreSignals();
         printf("not support restore signal for child process\n");
     }
 
@@ -1010,7 +1011,11 @@ do_fork_exec_for_occlum(char *const exec_array[],
 
     for (int i = 0; exec_array[i] != NULL; ++i) {
         const char *executable = exec_array[i];
-        posix_spawn(&pid, executable, &actions, &attr, argv, envp);
+        // printf("executable = %s\n", executable);
+        ret = posix_spawn(&pid, executable, &actions, &attr, argv, envp);
+        if (ret != 0) {
+            return -1;
+        }
         // if (errno != ENOENT && errno != ENOTDIR && saved_errno == 0) {
         //     saved_errno = errno;
         // }
@@ -1059,6 +1064,9 @@ subprocess_fork_exec(PyObject *module, PyObject *args)
     int saved_errno = 0;
     _posixsubprocessstate *state = get_posixsubprocess_state(module);
 
+    // PyObject ** stack = (PyObject **)((PyTupleObject *)args)->ob_item;
+    // char **test = &((PyBytesObject *)(((PyListObject *)stack[1])->ob_item[0]))->ob_sval[0];
+    // printf("raw executable = %s\n", test);
     if (!PyArg_ParseTuple(
             args, "OOpO!OOiiiiiiiiiiOOOiO:fork_exec",
             &process_args, &executable_list,
@@ -1123,9 +1131,12 @@ subprocess_fork_exec(PyObject *module, PyObject *args)
         Py_DECREF(result);
     }
 
+    // printf("executable list ob type = %s\n", executable_list->ob_type->tp_name);
     exec_array = _PySequence_BytesToCharpArray(executable_list);
     if (!exec_array)
         goto cleanup;
+
+    // printf("[test] before do fork exec = %s\n", exec_array[0]);
 
     /* Convert args and env into appropriate arguments for exec() */
     /* These conversions are done in the parent process to avoid allocating
@@ -1290,6 +1301,7 @@ subprocess_fork_exec(PyObject *module, PyObject *args)
     }
 #endif
 
+    // pid = do_fork_exec(exec_array, argv, envp, cwd,
     pid = do_fork_exec_for_occlum(exec_array, argv, envp, cwd,
                        p2cread, p2cwrite, c2pread, c2pwrite,
                        errread, errwrite, errpipe_read, errpipe_write,
